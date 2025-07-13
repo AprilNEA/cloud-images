@@ -32,15 +32,32 @@ jobs:
       run: |
         sudo apt-get update
         sudo apt-get install -y libguestfs-tools axel qemu-utils
+        # Install additional dependencies that might be needed
+        sudo apt-get install -y libguestfs-tools linux-image-generic
 
     - name: Download Debian Cloud Image
       run: |
         IMAGE_URL="https://cdimage.debian.org/images/cloud/bookworm/latest/debian-${DEBIAN_VERSION}-genericcloud-amd64.qcow2"
         axel -n 8 -o "debian-${DEBIAN_VERSION}-genericcloud-amd64-src.qcow2" "${IMAGE_URL}"
 
-    - name: Configure kernel access for libguestfs (CI only)
+    - name: Configure kernel access and environment
       run: |
+        # Allow access to kernel for libguestfs
         sudo dpkg-statoverride --update --add root root 0644 /boot/vmlinuz-$(uname -r)
+        
+        # Create working directory with proper permissions
+        sudo mkdir -p /var/tmp/libguestfs
+        sudo chmod 1777 /var/tmp/libguestfs
+        
+        # Set up environment for libguestfs
+        echo "LIBGUESTFS_CACHEDIR=/var/tmp/libguestfs" >> $GITHUB_ENV
+        echo "TMPDIR=/var/tmp/libguestfs" >> $GITHUB_ENV
+        echo "LIBGUESTFS_BACKEND=direct" >> $GITHUB_ENV
+
+    - name: Test libguestfs setup
+      run: |
+        # Test if libguestfs is working properly
+        sudo -E libguestfs-test-tool
 
     - name: Customize Debian Cloud Image
       run: |
@@ -49,9 +66,15 @@ jobs:
         PACKAGES="${PACKAGES},net-tools,iputils-ping,iputils-arping,iputils-tracepath"
         PACKAGES="${PACKAGES},nano,most,screen,less,vim,bzip2,lldpd,mtr-tiny,htop,dnsutils,zstd"
         
-        # Customize the image
-        sudo virt-customize -a "debian-${DEBIAN_VERSION}-genericcloud-amd64-src.qcow2" \
-          --smp 2 --verbose \
+        # Create a temporary directory for this specific run
+        WORK_DIR="/var/tmp/libguestfs/work-$$"
+        sudo mkdir -p "$WORK_DIR"
+        
+        # Customize the image with network disabled to avoid passt issues
+        sudo -E TMPDIR="$WORK_DIR" virt-customize -a "debian-${DEBIAN_VERSION}-genericcloud-amd64-src.qcow2" \
+          --network \
+          --smp 2 \
+          --memsize 2048 \
           --timezone "${TIMEZONE}" \
           --append-line "/etc/default/grub:# disables OS prober to avoid loopback detection which breaks booting" \
           --append-line "/etc/default/grub:GRUB_DISABLE_OS_PROBER=true" \
@@ -59,19 +82,45 @@ jobs:
           --run-command "systemctl enable serial-getty@ttyS1.service" \
           --run-command "sed -i 's|Types: deb deb-src|Types: deb|g' /etc/apt/sources.list.d/debian.sources" \
           --run-command "sed -i 's|generate_mirrorlists: true|generate_mirrorlists: false|g' /etc/cloud/cloud.cfg.d/01_debian_cloud.cfg" \
-          --update --install "${PACKAGES}" \
+          --update \
+          --install "${PACKAGES}" \
           --run-command "apt-get -y autoremove --purge && apt-get -y clean" \
           --append-line "/etc/systemd/timesyncd.conf:NTP=time.apple.com time.windows.com" \
           --delete "/var/log/*.log" \
           --delete "/var/lib/apt/lists/*" \
           --delete "/var/cache/apt/*" \
-          --truncate "/etc/machine-id"
+          --truncate "/etc/machine-id" || {
+            echo "virt-customize failed, trying alternative approach..."
+            # Alternative approach without network
+            sudo -E LIBGUESTFS_BACKEND_SETTINGS=network_bridge=virbr0 virt-customize -a "debian-${DEBIAN_VERSION}-genericcloud-amd64-src.qcow2" \
+              --no-network \
+              --smp 2 \
+              --timezone "${TIMEZONE}" \
+              --append-line "/etc/default/grub:# disables OS prober to avoid loopback detection which breaks booting" \
+              --append-line "/etc/default/grub:GRUB_DISABLE_OS_PROBER=true" \
+              --run-command "systemctl enable serial-getty@ttyS1.service" \
+              --run-command "sed -i 's|Types: deb deb-src|Types: deb|g' /etc/apt/sources.list.d/debian.sources || true" \
+              --run-command "sed -i 's|generate_mirrorlists: true|generate_mirrorlists: false|g' /etc/cloud/cloud.cfg.d/01_debian_cloud.cfg || true" \
+              --append-line "/etc/systemd/timesyncd.conf:NTP=time.apple.com time.windows.com" \
+              --delete "/var/log/*.log" || true \
+              --delete "/var/lib/apt/lists/*" || true \
+              --delete "/var/cache/apt/*" || true \
+              --truncate "/etc/machine-id"
+          }
+        
+        # Clean up temporary directory
+        sudo rm -rf "$WORK_DIR"
 
     - name: Compress and optimize image
       run: |
-        sudo virt-sparsify --compress \
+        sudo -E virt-sparsify --compress \
           "debian-${DEBIAN_VERSION}-genericcloud-amd64-src.qcow2" \
           "debian-${DEBIAN_VERSION}-genericcloud-amd64-custom.qcow2"
+
+    - name: Fix permissions
+      run: |
+        # Ensure the output file has proper permissions
+        sudo chown $USER:$USER "debian-${DEBIAN_VERSION}-genericcloud-amd64-custom.qcow2"
 
     - name: Generate image info
       run: |
@@ -141,52 +190,4 @@ jobs:
       with:
         name: pve-import-script-${{ github.run_number }}
         path: pve-import-template.sh
-        retention-days: 30
-
-    - name: Generate README
-      run: |
-        cat > README.md << EOF
-        # Custom Debian Cloud Image for Proxmox VE
-        
-        ## Image Details
-        - Base: Debian ${DEBIAN_VERSION} genericcloud
-        - Build Date: $(date -u +%Y-%m-%d)
-        - Timezone: ${TIMEZONE}
-        
-        ## Pre-installed Packages
-        - QEMU Guest Agent
-        - Network tools: net-tools, iputils-ping, mtr-tiny, dnsutils
-        - System tools: htop, screen, vim, nano
-        - Download tools: wget, curl, axel
-        - Others: sudo, bash-completion, unzip, bzip2, zstd, lldpd
-        
-        ## Customizations
-        - Disabled GRUB OS Prober
-        - Enabled ttyS1 serial console
-        - Disabled deb-src repositories
-        - Configured NTP servers (time.apple.com, time.windows.com)
-        - Cleaned logs and caches
-        - Cleared machine-id for proper cloud-init initialization
-        
-        ## Usage in Proxmox VE
-        
-        1. Download the image to your PVE host
-        2. Run the provided import script:
-           \`\`\`bash
-           ./pve-import-template.sh debian-${DEBIAN_VERSION}-genericcloud-amd64-custom.qcow2
-           \`\`\`
-        
-        3. Create new VMs from the template (ID 9000 by default)
-        
-        ## Notes
-        - The VM template uses DHCP by default
-        - Cloud-init is fully configured and ready to use
-        - The template has 1 vCPU and 1GB RAM by default (adjust after cloning)
-        EOF
-
-    - name: Upload README
-      uses: actions/upload-artifact@v4
-      with:
-        name: readme-${{ github.run_number }}
-        path: README.md
         retention-days: 30
