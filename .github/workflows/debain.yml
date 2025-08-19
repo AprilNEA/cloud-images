@@ -37,7 +37,21 @@ jobs:
 
     - name: Download Debian Cloud Image
       run: |
-        IMAGE_URL="https://cdimage.debian.org/images/cloud/bookworm/latest/debian-${DEBIAN_VERSION}-genericcloud-amd64.qcow2"
+        # Map Debian version number to codename
+        case "${DEBIAN_VERSION}" in
+          "10") CODENAME="buster" ;;
+          "11") CODENAME="bullseye" ;;
+          "12") CODENAME="bookworm" ;;
+          "13") CODENAME="trixie" ;;
+          *) 
+            echo "Unsupported Debian version: ${DEBIAN_VERSION}"
+            exit 1
+            ;;
+        esac
+        
+        IMAGE_URL="https://cdimage.debian.org/images/cloud/${CODENAME}/latest/debian-${DEBIAN_VERSION}-genericcloud-amd64.qcow2"
+        echo "Downloading Debian ${DEBIAN_VERSION} (${CODENAME}) cloud image..."
+        echo "URL: ${IMAGE_URL}"
         axel -n 8 -o "debian-${DEBIAN_VERSION}-genericcloud-amd64-src.qcow2" "${IMAGE_URL}"
 
     - name: Configure kernel access and environment
