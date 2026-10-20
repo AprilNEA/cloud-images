@@ -1,0 +1,4 @@
+/dist/
+/logs/
+*.qcow2
+__pycache__/

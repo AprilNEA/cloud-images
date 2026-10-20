@@ -1,0 +1,129 @@
+name: Build Custom Debian Cloud Image
+
+on:
+  push:
+    branches: [main]
+    paths: ['.github/**', 'scripts/**', 'tests/**', 'packages.txt']
+  pull_request:
+    branches: [main]
+    paths: ['.github/**', 'scripts/**', 'tests/**', 'packages.txt']
+  workflow_dispatch:
+    inputs:
+      debian_version:
+        description: Debian release
+        type: choice
+        options: ['13', '12']
+        default: '13'
+      timezone:
+        description: IANA timezone
+        type: string
+        default: Asia/Shanghai
+
+permissions:
+  contents: read
+
+concurrency:
+  group: debian-image-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check shell scripts and regression tests
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends shellcheck
+          for script in scripts/*.sh; do bash -n "$script"; done
+          shellcheck scripts/*.sh
+          python3 -m unittest discover -s tests -p 'test_build_image.py' -v
+          python3 -m unittest discover -s tests -p 'test_publish_release.py' -v
+          python3 -m unittest discover -s tests -p 'test_repository_language.py' -v
+          sudo python3 -m unittest discover -s tests -p 'test_pve_import.py' -v
+
+  build-image:
+    needs: validate
+    # Keep the host stable while ubuntu-latest migrates to Ubuntu 26.04.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    outputs:
+      artifact_name: ${{ steps.bundle-name.outputs.name }}
+    env:
+      DEBIAN_VERSION: ${{ inputs.debian_version || '13' }}
+      TIMEZONE: ${{ inputs.timezone || 'Asia/Shanghai' }}
+      LIBGUESTFS_BACKEND: direct
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          # Noble's supermin package list explicitly requires isc-dhcp-client.
+          sudo apt-get install -y --no-install-recommends \
+            libguestfs-tools qemu-utils linux-image-generic isc-dhcp-client \
+            curl ca-certificates python3 acl libslirp0
+          # Avoid Noble's passt launch failure without disabling AppArmor.
+          # libguestfs automatically uses QEMU's SLIRP backend when passt is absent.
+          sudo apt-get remove -y passt
+          # Only change kernel access on this disposable GitHub-hosted runner.
+          sudo find /boot -maxdepth 1 -type f -name 'vmlinuz-*' -exec chmod a+r {} +
+          if [[ -e /dev/kvm ]]; then
+            sudo setfacl -m "u:$(id -un):rw" /dev/kvm
+          else
+            echo '::warning::KVM is unavailable; libguestfs will use slower TCG emulation.'
+          fi
+          echo "TMPDIR=$RUNNER_TEMP" >> "$GITHUB_ENV"
+          echo "LIBGUESTFS_CACHEDIR=$RUNNER_TEMP/libguestfs-cache" >> "$GITHUB_ENV"
+      - name: Build and verify image
+        run: bash scripts/build-image.sh
+      - name: Record the artifact name for release retries
+        id: bundle-name
+        run: echo "name=debian-$DEBIAN_VERSION-cloud-custom-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
+      - name: Upload verified image bundle
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ steps.bundle-name.outputs.name }}
+          path: dist/
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 30
+      - name: Upload diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: debian-${{ env.DEBIAN_VERSION }}-build-logs-${{ github.run_id }}-${{ github.run_attempt }}
+          path: logs/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  release:
+    needs: build-image
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      actions: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      IMAGE_ARTIFACT: ${{ needs.build-image.outputs.artifact_name }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Download this run's verified image bundle
+        run: |
+          gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" \
+            --name "$IMAGE_ARTIFACT" \
+            --dir dist
+      - name: Publish release using the build date and commit
+        run: bash scripts/publish-release.sh dist
